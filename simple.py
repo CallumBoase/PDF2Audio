@@ -144,40 +144,66 @@ def process_pdf(pdf_file, api_key, voice, tts_model):
         
         # Create a temporary directory for audio chunks
         temp_dir = "./temp_audio_chunks"
-        os.makedirs(temp_dir, exist_ok=True)
+        try:
+            os.makedirs(temp_dir, exist_ok=True)
+            logger.info(f"Created temporary directory: {temp_dir}")
+        except Exception as e:
+            logger.error(f"Failed to create temporary directory: {e}")
+            raise
         
-        # Process chunks in parallel using ThreadPoolExecutor, but maintain order
-        chunk_audio_parts = [None] * len(chunks)  # Initialize list to hold results in correct order
+        # Process chunks and save to individual files to maintain order
+        chunk_files = []
         
+        def process_and_save_chunk(chunk_index, chunk_text):
+            """Process a chunk and save to a temporary file with ordered name"""
+            try:
+                chunk_audio = generate_audio_chunk(chunk_text, api_key, voice, tts_model)
+                # Create a temporary file with ordered naming
+                chunk_filename = os.path.join(temp_dir, f"chunk_{chunk_index:04d}.mp3")
+                with open(chunk_filename, "wb") as f:
+                    f.write(chunk_audio)
+                logger.info(f"Processed chunk {chunk_index+1}/{len(chunks)}")
+                return chunk_filename
+            except Exception as e:
+                logger.error(f"Error processing chunk {chunk_index+1}: {e}")
+                raise
+        
+        # Use ThreadPoolExecutor for parallel processing, but ensure proper ordering
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            # Submit all tasks and keep track of which future corresponds to which chunk
-            future_to_index = {
-                executor.submit(generate_audio_chunk, chunk, api_key, voice, tts_model): i
-                for i, chunk in enumerate(chunks)
-            }
+            # Submit all tasks with their indices
+            future_to_index = {}
+            for i, chunk in enumerate(chunks):
+                future = executor.submit(process_and_save_chunk, i, chunk)
+                future_to_index[future] = i
             
-            # Process results as they complete
+            # Process results and collect filenames in order
+            chunk_files = [None] * len(chunks)
             for future in concurrent.futures.as_completed(future_to_index):
                 index = future_to_index[future]
                 try:
-                    chunk_audio = future.result()
-                    # Store result in the correct position to maintain order
-                    chunk_audio_parts[index] = chunk_audio
-                    logger.info(f"Processed chunk {index+1}/{len(chunks)}")
+                    filename = future.result()
+                    chunk_files[index] = filename
                 except Exception as e:
                     logger.error(f"Error processing chunk {index+1}: {e}")
                     raise
         
-        # Combine audio parts in the original order
-        audio_data = b""
-        for part in chunk_audio_parts:
-            if part is not None:
-                audio_data += part
-        
-        # Create a temporary file for the combined audio
+        # Combine audio files in correct order
         temp_audio_path = "temp_audio.mp3"
-        with open(temp_audio_path, "wb") as f:
-            f.write(audio_data)
+        with open(temp_audio_path, "wb") as outfile:
+            # Ensure we process in index order
+            for chunk_file in chunk_files:
+                if chunk_file and os.path.exists(chunk_file):
+                    with open(chunk_file, "rb") as infile:
+                        outfile.write(infile.read())
+        
+        # Clean up temporary chunk files
+        logger.info("Cleaning up temporary audio chunk files")
+        for chunk_file in chunk_files:
+            if chunk_file and os.path.exists(chunk_file):
+                try:
+                    os.remove(chunk_file)
+                except Exception as e:
+                    logger.warning(f"Failed to remove temporary file {chunk_file}: {e}")
         
         return temp_audio_path, None, cleaned_text
     
