@@ -2,11 +2,17 @@ import os
 import io
 import re
 from pathlib import Path
+import textwrap
+import concurrent.futures
+from tempfile import NamedTemporaryFile
 
 import gradio as gr
 from openai import OpenAI
 from pypdf import PdfReader
 from loguru import logger
+
+# Maximum text length for OpenAI TTS API (4096 characters, but using 4000 to be safe)
+MAX_TTS_LENGTH = 4000
 
 def extract_text_from_pdf(file_path):
     """Extract text from a PDF file with minimal processing"""
@@ -37,7 +43,6 @@ def clean_text(text):
     text = re.sub(r'\n\s*\d+\s*\n', '\n', text)
     
     # Remove header/footer patterns if they appear on every page
-    # This is a simple version - might need to be customized based on specific PDFs
     text = re.sub(r'\n\s*[A-Za-z0-9_\-\.]+\s*\|\s*[A-Za-z0-9_\-\.]+\s*\n', '\n', text)
     
     # Fix multiple newlines
@@ -45,8 +50,62 @@ def clean_text(text):
     
     return text
 
-def generate_audio(text, api_key, voice="alloy", model="tts-1"):
-    """Generate audio directly from text using OpenAI TTS"""
+def split_text_into_chunks(text, max_length=MAX_TTS_LENGTH):
+    """
+    Split text into chunks that are small enough for the TTS API.
+    Try to split at paragraph or sentence boundaries where possible.
+    """
+    # If text is already short enough, return it as a single chunk
+    if len(text) <= max_length:
+        return [text]
+    
+    chunks = []
+    
+    # First try to split by paragraphs (double newlines)
+    paragraphs = text.split('\n\n')
+    
+    current_chunk = ""
+    for paragraph in paragraphs:
+        # If adding this paragraph would exceed the limit, save current chunk and start a new one
+        if len(current_chunk) + len(paragraph) + 2 > max_length:
+            # If current paragraph is too long by itself, split by sentences
+            if len(paragraph) > max_length:
+                # Try to split by sentences (period followed by space)
+                sentences = re.split(r'(?<=\. )', paragraph)
+                
+                # Add sentences to current chunk until it's full
+                for sentence in sentences:
+                    if len(current_chunk) + len(sentence) + 1 > max_length:
+                        # If current sentence is still too long, split by words
+                        if len(sentence) > max_length:
+                            words = sentence.split(' ')
+                            for word in words:
+                                if len(current_chunk) + len(word) + 1 > max_length:
+                                    chunks.append(current_chunk.strip())
+                                    current_chunk = word + " "
+                                else:
+                                    current_chunk += word + " "
+                        else:
+                            # Add chunk and start new one with this sentence
+                            chunks.append(current_chunk.strip())
+                            current_chunk = sentence + " "
+                    else:
+                        current_chunk += sentence + " "
+            else:
+                # Add chunk and start new one with this paragraph
+                chunks.append(current_chunk.strip())
+                current_chunk = paragraph + "\n\n"
+        else:
+            current_chunk += paragraph + "\n\n"
+    
+    # Add the final chunk if there's anything left
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+    
+    return chunks
+
+def generate_audio_chunk(text, api_key, voice="alloy", model="tts-1"):
+    """Generate audio for a single chunk of text"""
     client = OpenAI(api_key=api_key)
     
     try:
@@ -58,7 +117,7 @@ def generate_audio(text, api_key, voice="alloy", model="tts-1"):
         
         return response.content
     except Exception as e:
-        logger.error(f"Error generating audio: {e}")
+        logger.error(f"Error generating audio for chunk: {e}")
         raise
 
 def process_pdf(pdf_file, api_key, voice, tts_model):
@@ -71,13 +130,41 @@ def process_pdf(pdf_file, api_key, voice, tts_model):
         logger.info("Extracting text from PDF")
         text = extract_text_from_pdf(pdf_file.name)
         
-        # Clean the text
+        # Clean the text (minimal processing)
         logger.info("Cleaning text")
         cleaned_text = clean_text(text)
         
-        # Generate audio
+        # Split text into chunks
+        logger.info("Splitting text into chunks")
+        chunks = split_text_into_chunks(cleaned_text)
+        logger.info(f"Text split into {len(chunks)} chunks")
+        
+        # Generate audio for each chunk in parallel
         logger.info(f"Generating audio with voice '{voice}' using model '{tts_model}'")
-        audio_data = generate_audio(cleaned_text, api_key, voice, tts_model)
+        
+        # Create a temporary directory for audio chunks
+        temp_dir = "./temp_audio_chunks"
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        audio_data = b""
+        
+        # Process chunks in parallel using ThreadPoolExecutor
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            # Submit all tasks
+            futures = [
+                executor.submit(generate_audio_chunk, chunk, api_key, voice, tts_model)
+                for chunk in chunks
+            ]
+            
+            # Collect results as they complete
+            for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                try:
+                    chunk_audio = future.result()
+                    audio_data += chunk_audio
+                    logger.info(f"Processed chunk {i+1}/{len(chunks)}")
+                except Exception as e:
+                    logger.error(f"Error processing chunk {i+1}: {e}")
+                    raise
         
         # Create a temporary file for the audio
         temp_audio_path = "temp_audio.mp3"
