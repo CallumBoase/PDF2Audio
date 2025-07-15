@@ -146,27 +146,35 @@ def process_pdf(pdf_file, api_key, voice, tts_model):
         temp_dir = "./temp_audio_chunks"
         os.makedirs(temp_dir, exist_ok=True)
         
-        audio_data = b""
+        # Process chunks in parallel using ThreadPoolExecutor, but maintain order
+        chunk_audio_parts = [None] * len(chunks)  # Initialize list to hold results in correct order
         
-        # Process chunks in parallel using ThreadPoolExecutor
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            # Submit all tasks
-            futures = [
-                executor.submit(generate_audio_chunk, chunk, api_key, voice, tts_model)
-                for chunk in chunks
-            ]
+            # Submit all tasks and keep track of which future corresponds to which chunk
+            future_to_index = {
+                executor.submit(generate_audio_chunk, chunk, api_key, voice, tts_model): i
+                for i, chunk in enumerate(chunks)
+            }
             
-            # Collect results as they complete
-            for i, future in enumerate(concurrent.futures.as_completed(futures)):
+            # Process results as they complete
+            for future in concurrent.futures.as_completed(future_to_index):
+                index = future_to_index[future]
                 try:
                     chunk_audio = future.result()
-                    audio_data += chunk_audio
-                    logger.info(f"Processed chunk {i+1}/{len(chunks)}")
+                    # Store result in the correct position to maintain order
+                    chunk_audio_parts[index] = chunk_audio
+                    logger.info(f"Processed chunk {index+1}/{len(chunks)}")
                 except Exception as e:
-                    logger.error(f"Error processing chunk {i+1}: {e}")
+                    logger.error(f"Error processing chunk {index+1}: {e}")
                     raise
         
-        # Create a temporary file for the audio
+        # Combine audio parts in the original order
+        audio_data = b""
+        for part in chunk_audio_parts:
+            if part is not None:
+                audio_data += part
+        
+        # Create a temporary file for the combined audio
         temp_audio_path = "temp_audio.mp3"
         with open(temp_audio_path, "wb") as f:
             f.write(audio_data)
@@ -199,7 +207,7 @@ def create_ui():
                 )
                 tts_model = gr.Dropdown(
                     label="TTS Model",
-                    choices=["tts-1", "tts-1-hd"],
+                    choices=["gpt-4o-mini-tts", "tts-1", "tts-1-hd"],
                     value="tts-1"
                 )
                 submit_btn = gr.Button("Generate Audio")
